@@ -1,0 +1,4 @@
+streamlit==1.58.0
+pykrx==1.2.8
+anthropic==0.109.1
+pandas==2.3.3
