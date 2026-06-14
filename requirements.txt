@@ -1,4 +1,7 @@
 streamlit==1.58.0
-pykrx==1.2.8
 anthropic==0.109.1
 pandas==2.3.3
+requests==2.32.3
+beautifulsoup4==4.15.0
+finance-datareader==0.9.202
+lxml==6.1.1

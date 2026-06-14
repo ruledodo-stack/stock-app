@@ -1,14 +1,15 @@
 import streamlit as st
 import pandas as pd
+import requests
+from bs4 import BeautifulSoup
 from datetime import datetime, timezone, timedelta
-import time, os
+import time, os, re
 
 KST = timezone(timedelta(hours=9))
 
 st.set_page_config(page_title="단타·종가 AI 추천", page_icon="📈", layout="centered")
 
-# Streamlit secrets에서 KRX 인증 정보 자동 로드
-for _key in ["KRX_ID", "KRX_PW", "ANTHROPIC_API_KEY"]:
+for _key in ["ANTHROPIC_API_KEY"]:
     if _key not in os.environ:
         try:
             os.environ[_key] = st.secrets[_key]
@@ -30,17 +31,17 @@ div[data-testid="stSpinner"] > div { border-top-color: #ff6b6b !important; }
     unsafe_allow_html=True,
 )
 
+_ETF_RE = re.compile(
+    r"KODEX|TIGER|KBSTAR|ARIRANG|HANARO|\bACE\b|KOSEF|KINDEX|ETF|레버리지|인버스|선물|채권|국채|MSCI|\bSOL\b|\bPLUS\b|TIMEFOLIO",
+    re.IGNORECASE,
+)
+_NAVER_HDR = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+}
+
 
 def now_kst():
     return datetime.now(KST)
-
-
-def prev_trading_day(d):
-    for i in range(1, 8):
-        t = d - timedelta(days=i)
-        if t.weekday() < 5:
-            return t.strftime("%Y%m%d")
-    return (d - timedelta(days=1)).strftime("%Y%m%d")
 
 
 def calc_rsi(series, period=14):
@@ -75,71 +76,118 @@ def rsi_score(rsi, mode):
         return 2
 
 
-@st.cache_data(ttl=180)
-def load_bulk_data(date_key):
-    try:
-        from pykrx import stock
-        now = now_kst()
-        today = now.strftime("%Y%m%d")
-        yesterday = prev_trading_day(now)
-        rows = []
-        for market in ["KOSPI", "KOSDAQ"]:
-            try:
-                dt = stock.get_market_ohlcv_by_ticker(today, market=market)
-                dp = stock.get_market_ohlcv_by_ticker(yesterday, market=market)
-                if dt.empty or dp.empty:
-                    continue
-                for ticker in dt.index.intersection(dp.index):
-                    t, p = dt.loc[ticker], dp.loc[ticker]
-                    if p["거래량"] <= 0 or t["거래량"] <= 0 or p["종가"] <= 0:
-                        continue
-                    gap = (t["시가"] - p["종가"]) / p["종가"] * 100
-                    chg = (t["종가"] - p["종가"]) / p["종가"] * 100
-                    vol = t["거래량"] / p["거래량"]
-                    val = t.get("거래대금", 0) / 1e8
-                    high_ratio = (t["종가"] / t["고가"] * 100) if t["고가"] > 0 else 0
-                    rows.append(
-                        {
-                            "종목코드": ticker,
-                            "시장": market,
-                            "현재가": int(t["종가"]),
-                            "갭": round(gap, 2),
-                            "거래량배율": round(vol, 1),
-                            "등락률": round(chg, 2),
-                            "거래대금억": round(val, 1),
-                            "종가고가비율": round(high_ratio, 1),
-                        }
-                    )
-            except:
+def _parse_naver_table(soup, market):
+    rows = {}
+    table = soup.find("table", {"class": "type_2"})
+    if not table:
+        return rows, 0
+    count = 0
+    for tr in table.find_all("tr"):
+        tds = tr.find_all("td")
+        if len(tds) < 7:
+            continue
+        a = tds[1].find("a") if len(tds) > 1 else None
+        if not a or "code=" not in a.get("href", ""):
+            continue
+        ticker = a["href"].split("code=")[1][:6]
+        name = a.text.strip()
+        if not ticker.isdigit() or _ETF_RE.search(name):
+            continue
+        try:
+            def n(td):
+                t = td.text.strip().replace(",", "").replace("+", "").replace("%", "")
+                return t.replace("−", "-").replace("▲", "").replace("▼", "-").strip()
+
+            price = int(n(tds[2])) if n(tds[2]) else 0
+            chg = float(n(tds[4])) if n(tds[4]) else 0.0
+            vol = int(n(tds[5])) if n(tds[5]) else 0
+            val_s = n(tds[6])
+            val = float(val_s) / 100 if val_s else 0.0  # 백만원 → 억원
+
+            if price < 1000 or price > 500000:
                 continue
-        return pd.DataFrame(rows) if rows else pd.DataFrame()
-    except:
-        return pd.DataFrame()
+            if ticker not in rows:
+                rows[ticker] = {
+                    "종목코드": ticker,
+                    "종목명": name,
+                    "시장": market,
+                    "현재가": price,
+                    "등락률": round(chg, 2),
+                    "거래량": vol,
+                    "거래대금억": round(val, 1),
+                }
+            count += 1
+        except:
+            continue
+    return rows, count
+
+
+@st.cache_data(ttl=180)
+def load_naver_candidates(date_key):
+    all_rows = {}
+    for sosok, market in [("0", "KOSPI"), ("1", "KOSDAQ")]:
+        for url_type in ["sise_quant", "sise_rise"]:
+            for page in range(1, 4):
+                try:
+                    url = f"https://finance.naver.com/sise/{url_type}.nhn?sosok={sosok}&page={page}"
+                    resp = requests.get(url, headers=_NAVER_HDR, timeout=15)
+                    resp.encoding = "euc-kr"
+                    soup = BeautifulSoup(resp.text, "html.parser")
+                    rows, count = _parse_naver_table(soup, market)
+                    for k, v in rows.items():
+                        if k not in all_rows:
+                            all_rows[k] = v
+                    if count == 0:
+                        break
+                except:
+                    break
+    return pd.DataFrame(list(all_rows.values())) if all_rows else pd.DataFrame()
 
 
 @st.cache_data(ttl=600)
-def get_indicators(ticker, today):
+def get_indicators(ticker, date_key):
     try:
-        from pykrx import stock
+        import FinanceDataReader as fdr
+
         now = now_kst()
-        start = (now - timedelta(days=50)).strftime("%Y%m%d")
-        hist = stock.get_market_ohlcv_by_date(start, today, ticker)
-        if hist is None or len(hist) < 20:
-            return 50.0, False, False, ticker
-        c = hist["종가"]
+        start = (now - timedelta(days=70)).strftime("%Y-%m-%d")
+        end = now.strftime("%Y-%m-%d")
+        df = fdr.DataReader(ticker, start, end)
+        if df is None or len(df) < 22:
+            return 50.0, False, False, 0.0, 0.0, 0.0
+
+        c = df["Close"]
+        has_today = df.index[-1].date() >= now.date()
+
+        if has_today and len(df) >= 2:
+            gap = (
+                (float(df["Open"].iloc[-1]) - float(df["Close"].iloc[-2]))
+                / float(df["Close"].iloc[-2])
+                * 100
+            )
+            today_vol = float(df["Volume"].iloc[-1])
+            avg_vol = float(df["Volume"].iloc[-21:-1].mean())
+            vol_ratio = today_vol / avg_vol if avg_vol > 0 else 0.0
+            today_high = float(df["High"].iloc[-1])
+            high_ratio = (float(c.iloc[-1]) / today_high * 100) if today_high > 0 else 0.0
+        else:
+            gap, vol_ratio, high_ratio = 0.0, 0.0, 0.0
+
         rsi = calc_rsi(c)
-        ma_ok = c.rolling(5).mean().iloc[-1] > c.rolling(20).mean().iloc[-1]
-        macd_ok = (c.ewm(span=12).mean().iloc[-1] - c.ewm(span=26).mean().iloc[-1]) > 0
-        name = stock.get_market_ticker_name(ticker)
-        return rsi, ma_ok, macd_ok, name
+        ma_ok = bool(c.rolling(5).mean().iloc[-1] > c.rolling(20).mean().iloc[-1])
+        macd_ok = bool(
+            (c.ewm(span=12).mean().iloc[-1] - c.ewm(span=26).mean().iloc[-1]) > 0
+        )
+        return rsi, ma_ok, macd_ok, round(gap, 2), round(vol_ratio, 1), round(high_ratio, 1)
     except:
-        return 50.0, False, False, ticker
+        return 50.0, False, False, 0.0, 0.0, 0.0
 
 
 @st.cache_data(ttl=600)
 def get_comment(name, vol, gap, chg, rsi, mode):
     try:
         import anthropic
+
         key = os.environ.get("ANTHROPIC_API_KEY", "")
         if not key:
             return f"거래량 {vol}배 + 갭 {gap}% → {'눌림목 진입 검토' if mode == 'danta' else '다음날 갭상승 기대'}"
@@ -160,42 +208,56 @@ def get_comment(name, vol, gap, chg, rsi, mode):
         return f"{'단타' if mode == 'danta' else '종가배팅'} 주목"
 
 
-def get_picks(df, today, mode):
+def get_picks(df, date_key, mode):
     if df.empty:
         return []
+
     if mode == "danta":
         cands = df[
-            (df["갭"] >= 1.0)
-            & (df["갭"] <= 10)
-            & (df["거래량배율"] >= 3.0)
-            & (df["등락률"] > 0)
+            (df["등락률"] > 0)
             & (df["현재가"] >= 1000)
             & (df["현재가"] <= 200000)
             & (df["거래대금억"] >= 50)
         ].copy()
+        sort_col = "거래량"
     else:
         cands = df[
-            (df["거래대금억"] >= 200)
-            & (df["등락률"] > 0)
+            (df["등락률"] > 0)
             & (df["현재가"] >= 1000)
-            & (df["종가고가비율"] >= 85)
+            & (df["거래대금억"] >= 200)
         ].copy()
+        sort_col = "거래대금억"
+
     if cands.empty:
         return []
-    pre_col = "거래량배율" if mode == "danta" else "거래대금억"
-    top20 = cands.nlargest(20, pre_col)
+
+    top30 = cands.nlargest(30, sort_col)
     results = []
-    for _, row in top20.iterrows():
-        rsi, ma_ok, macd_ok, name = get_indicators(row["종목코드"], today)
+
+    for _, row in top30.iterrows():
+        rsi, ma_ok, macd_ok, gap, vol_ratio, high_ratio = get_indicators(
+            row["종목코드"], date_key
+        )
+
+        if mode == "danta":
+            if gap < 1.0 or gap > 10:
+                continue
+            if vol_ratio < 3.0:
+                continue
+        else:
+            if high_ratio < 85:
+                continue
+            if not ma_ok:
+                continue
+
         rs = rsi_score(rsi, mode)
         if rs == -9999:
             continue
-        if mode == "jongga" and not ma_ok:
-            continue
+
         if mode == "danta":
             score = (
-                row["거래량배율"] * 0.35
-                + row["갭"] * 0.25
+                vol_ratio * 0.35
+                + gap * 0.25
                 + row["등락률"] * 0.20
                 + rs * 0.20
             )
@@ -210,16 +272,20 @@ def get_picks(df, today, mode):
                 + rs * 0.3
                 + (30 if ma_ok else 0) * 0.2
             )
+
         results.append(
             {
                 **row.to_dict(),
+                "갭": gap,
+                "거래량배율": vol_ratio,
+                "종가고가비율": high_ratio,
                 "RSI": rsi,
                 "MA정배열": ma_ok,
                 "MACD양수": macd_ok,
-                "종목명": name,
                 "점수": round(score, 2),
             }
         )
+
     results.sort(key=lambda x: x["점수"], reverse=True)
     return results[:5]
 
@@ -240,6 +306,15 @@ def card(s, rank, mode):
         badges.append("MA⚠️")
     if s["MACD양수"]:
         badges.append("MACD✅")
+
+    if mode == "jongga":
+        metric1_val = f"{s['종가고가비율']}%"
+        metric1_label = "종가/고가"
+    else:
+        gap_v = s["갭"]
+        metric1_val = f"+{gap_v}%" if gap_v >= 0 else f"{gap_v}%"
+        metric1_label = "갭"
+
     extra = (
         f"<span style='color:#2244aa;'>{s['거래대금억']}억</span>"
         if mode == "jongga"
@@ -266,8 +341,8 @@ def card(s, rank, mode):
       <div style='color:#666666;font-size:0.68rem;'>거래량</div>
     </div>
     <div style='text-align:center;'>
-      <div style='color:{accent};font-weight:700;'>+{s["갭"]}%</div>
-      <div style='color:#666666;font-size:0.68rem;'>갭</div>
+      <div style='color:{accent};font-weight:700;'>{metric1_val}</div>
+      <div style='color:#666666;font-size:0.68rem;'>{metric1_label}</div>
     </div>
     <div style='text-align:center;'>
       <div style='color:#ff9900;font-weight:700;'>{s["RSI"]}</div>
@@ -295,7 +370,7 @@ def no_pick_box(mode):
      padding:18px 20px;text-align:center;margin-bottom:1rem;'>
   <div style='font-size:1.3rem;margin-bottom:5px;'>🙅</div>
   <div style='color:{color};font-weight:700;'>오늘 {label} 없음 — 쉬는 날</div>
-  <div style='color:#1a1010;font-size:0.78rem;margin-top:5px;'>{cond} 동시 충족 종목 없음</div>
+  <div style='color:#444444;font-size:0.78rem;margin-top:5px;'>{cond} 동시 충족 종목 없음</div>
 </div>""",
         unsafe_allow_html=True,
     )
@@ -396,18 +471,18 @@ def main():
     # ── 9:00~9:10 모니터링 ──
     if now < t910:
         rem = int((t910 - now).total_seconds())
-        m, s = divmod(rem, 60)
+        m2, s2 = divmod(rem, 60)
         st.markdown(
             f"""
 <div style='background:#0a1a0a;border:1px solid #1a3a1a;border-radius:12px;
      padding:18px 22px;margin-bottom:1rem;display:flex;justify-content:space-between;align-items:center;'>
   <div>
     <div style='color:#4CAF50;font-weight:700;'>⚡ 장 시작 · 분석 중</div>
-    <div style='color:#1a2a1a;font-size:0.78rem;margin-top:3px;'>9:10 · 9:20 · 9:30 단타 3회 추천 예정</div>
+    <div style='color:#446644;font-size:0.78rem;margin-top:3px;'>9:10 · 9:20 · 9:30 단타 3회 추천 예정</div>
   </div>
   <div style='text-align:right;'>
-    <div style='color:#4CAF50;font-size:1.8rem;font-weight:900;'>{m:02d}:{s:02d}</div>
-    <div style='color:#1a2a1a;font-size:0.72rem;'>9:10 첫 추천</div>
+    <div style='color:#4CAF50;font-size:1.8rem;font-weight:900;'>{m2:02d}:{s2:02d}</div>
+    <div style='color:#446644;font-size:0.72rem;'>9:10 첫 추천</div>
   </div>
 </div>""",
             unsafe_allow_html=True,
@@ -426,8 +501,8 @@ def main():
         unsafe_allow_html=True,
     )
 
-    with st.spinner("데이터 로딩 중..."):
-        df = load_bulk_data(today)
+    with st.spinner("네이버 데이터 로딩 중..."):
+        df = load_naver_candidates(today)
 
     if df.empty:
         st.error("⚠️ 시장 데이터 로드 실패 — 네트워크 오류 또는 장 휴장일")
@@ -465,18 +540,18 @@ def main():
     if now < t1450:
         rem = int((t1450 - now).total_seconds())
         h2, r2 = divmod(rem, 3600)
-        m2, s2 = divmod(r2, 60)
+        m3, s3 = divmod(r2, 60)
         st.markdown(
             f"""
 <div style='background:#08080f;border:1px solid #15152a;border-radius:12px;
      padding:16px 20px;display:flex;justify-content:space-between;align-items:center;'>
   <div>
     <div style='color:#4488ff;font-weight:700;'>🌙 종가배팅 대기 중</div>
-    <div style='color:#15152a;font-size:0.75rem;margin-top:3px;'>거래대금200억↑ · RSI40~68 · MA정배열</div>
+    <div style='color:#334466;font-size:0.75rem;margin-top:3px;'>거래대금200억↑ · RSI40~68 · MA정배열</div>
   </div>
   <div style='text-align:right;'>
-    <div style='color:#4488ff;font-size:1.7rem;font-weight:900;'>{h2:02d}:{m2:02d}:{s2:02d}</div>
-    <div style='color:#15152a;font-size:0.72rem;'>14:50 확정</div>
+    <div style='color:#4488ff;font-size:1.7rem;font-weight:900;'>{h2:02d}:{m3:02d}:{s3:02d}</div>
+    <div style='color:#334466;font-size:0.72rem;'>14:50 확정</div>
   </div>
 </div>""",
             unsafe_allow_html=True,
@@ -517,7 +592,7 @@ def main():
         st.rerun()
 
     st.markdown(
-        f"<div style='color:#111;font-size:0.68rem;margin-top:0.5rem;text-align:center;'>손절 -2% · 단타 +1~3% · 종가배팅 다음날 시초 매도 · {now.strftime('%H:%M:%S')}</div>",
+        f"<div style='color:#444444;font-size:0.68rem;margin-top:0.5rem;text-align:center;'>손절 -2% · 단타 +1~3% · 종가배팅 다음날 시초 매도 · {now.strftime('%H:%M:%S')}</div>",
         unsafe_allow_html=True,
     )
     time.sleep(60)
