@@ -45,7 +45,6 @@ def now_kst():
     return datetime.now(KST)
 
 
-# ── 파일 캐시: 확정된 추천은 JSON으로 저장해 세션 재시작/새로고침에도 유지 ──
 def save_picks_cache(date_key, slot_key, picks):
     try:
         os.makedirs(CACHE_DIR, exist_ok=True)
@@ -166,17 +165,18 @@ def load_naver_candidates(date_key):
     return pd.DataFrame(list(all_rows.values())) if all_rows else pd.DataFrame()
 
 
+# [수정 3·4] rsi14·rsi2 동시 반환 / days 45일로 단축
 @st.cache_data(ttl=600)
 def get_indicators(ticker, date_key):
     try:
         import FinanceDataReader as fdr
 
         now = now_kst()
-        start = (now - timedelta(days=70)).strftime("%Y-%m-%d")
+        start = (now - timedelta(days=45)).strftime("%Y-%m-%d")
         end = now.strftime("%Y-%m-%d")
         df = fdr.DataReader(ticker, start, end)
         if df is None or len(df) < 22:
-            return 50.0, False, False, 0.0, 0.0, 0.0
+            return 50.0, 50.0, False, False, 0.0, 0.0, 0.0
 
         c = df["Close"]
         has_today = df.index[-1].date() >= now.date()
@@ -195,16 +195,18 @@ def get_indicators(ticker, date_key):
         else:
             gap, vol_ratio, high_ratio = 0.0, 0.0, 0.0
 
-        rsi = calc_rsi(c)
+        rsi14 = calc_rsi(c, 14)
+        rsi2 = calc_rsi(c, 2)
         ma_ok = bool(c.rolling(5).mean().iloc[-1] > c.rolling(20).mean().iloc[-1])
         macd_ok = bool(
             (c.ewm(span=12).mean().iloc[-1] - c.ewm(span=26).mean().iloc[-1]) > 0
         )
-        return rsi, ma_ok, macd_ok, round(gap, 2), round(vol_ratio, 1), round(high_ratio, 1)
+        return rsi14, rsi2, ma_ok, macd_ok, round(gap, 2), round(vol_ratio, 1), round(high_ratio, 1)
     except:
-        return 50.0, False, False, 0.0, 0.0, 0.0
+        return 50.0, 50.0, False, False, 0.0, 0.0, 0.0
 
 
+# [수정 1] 모델명 claude-sonnet-4-5
 @st.cache_data(ttl=600)
 def get_comment(name, vol, gap, chg, rsi, mode):
     try:
@@ -215,13 +217,13 @@ def get_comment(name, vol, gap, chg, rsi, mode):
             return f"거래량 {vol}배 + 갭 {gap}% → {'눌림목 진입 검토' if mode == 'danta' else '다음날 갭상승 기대'}"
         client = anthropic.Anthropic(api_key=key)
         msg = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-5",
             max_tokens=60,
             messages=[
                 {
                     "role": "user",
                     "content": f"{name}: 거래량{vol}x 갭{gap}% 등락{chg}% RSI{rsi}. "
-                    f"{'마하세븐 단타' if mode == 'danta' else '종가배팅'} 1줄분석 20자이내",
+                    f"{'단타브레이크아웃' if mode == 'danta' else '오버나이트종가배팅'} 1줄분석 20자이내",
                 }
             ],
         )
@@ -243,7 +245,7 @@ def get_picks(df, date_key, mode):
         ].copy()
         sort_col = "거래량"
     else:
-        # 등락률 8% 미만: 당일 급등주는 다음날 차익실현 갭다운 리스크가 높아 제외
+        # [수정 2] 등락률 8% 미만: 급등주 갭다운 리스크 제외
         cands = df[
             (df["등락률"] > 0)
             & (df["등락률"] < 8)
@@ -255,11 +257,13 @@ def get_picks(df, date_key, mode):
     if cands.empty:
         return []
 
-    top30 = cands.nlargest(30, sort_col)
+    # [수정 4] top30 → top15
+    top15 = cands.nlargest(15, sort_col)
     results = []
 
-    for _, row in top30.iterrows():
-        rsi, ma_ok, macd_ok, gap, vol_ratio, high_ratio = get_indicators(
+    for _, row in top15.iterrows():
+        # [수정 3] rsi2 추가 언패킹
+        rsi, rsi2, ma_ok, macd_ok, gap, vol_ratio, high_ratio = get_indicators(
             row["종목코드"], date_key
         )
 
@@ -269,7 +273,10 @@ def get_picks(df, date_key, mode):
             if vol_ratio < 3.0:
                 continue
         else:
-            if high_ratio < 85:
+            # [수정 2] 종가 >= 고가 * 0.95 + 거래량 1.5배 조건 추가
+            if high_ratio < 95:
+                continue
+            if vol_ratio < 1.5:
                 continue
             if not ma_ok:
                 continue
@@ -289,6 +296,9 @@ def get_picks(df, date_key, mode):
                 score *= 1.1
             if ma_ok:
                 score *= 1.05
+            # [수정 3] RSI(2) < 10: 단기 눌림목 확인 시 보너스
+            if rsi2 < 10:
+                score += 15
         else:
             score = (
                 row["거래대금억"] * 0.3
@@ -373,9 +383,9 @@ def no_pick_box(mode):
     color = "#ff6b6b" if mode == "danta" else "#4488ff"
     label = "단타" if mode == "danta" else "종가배팅"
     cond = (
-        "갭1%↑ + 거래량3배↑ + RSI50~75"
+        "갭1%↑ + 거래량3배↑ + RSI50~75 + RSI(2)보너스"
         if mode == "danta"
-        else "거래대금200억↑ + 등락률<8% + RSI40~68 + MA정배열"
+        else "거래대금200억↑ + 등락률<8% + RSI40~68 + MA정배열 + 종가/고가≥95% + 거래량1.5배↑"
     )
     st.markdown(
         f"""
@@ -469,12 +479,13 @@ def main():
     t1450 = now.replace(hour=14, minute=50, second=0, microsecond=0)
     t1530 = now.replace(hour=15, minute=30, second=0, microsecond=0)
 
+    # [수정 5] 헤더 전략명 변경
     st.markdown(
         f"""
 <div style='margin-bottom:1.2rem;'>
   <div style='font-size:1.7rem;font-weight:900;color:#fff;letter-spacing:-1px;'>📈 단타·종가 AI 추천</div>
   <div style='color:#666;font-size:0.75rem;margin-top:3px;'>
-    마하세븐·고명환·Ross Cameron 공식 · {now.strftime("%Y.%m.%d %H:%M:%S")} KST
+    신고가돌파·거래량급증·오버나이트 전략 기반 · {now.strftime("%Y.%m.%d %H:%M:%S")} KST
   </div>
 </div>""",
         unsafe_allow_html=True,
@@ -487,8 +498,8 @@ def main():
             """
 <div style='background:#0a0a0a;border:1px solid #131313;border-radius:10px;
      padding:14px 18px;color:#777;font-size:0.78rem;line-height:1.9;'>
-  🔴 <b style='color:#888;'>단타</b> 9:10 · 9:20 · 9:30 총 3회 · 갭1%↑ + 거래량3배↑ + RSI50~75<br>
-  🌙 <b style='color:#888;'>종가배팅</b> 14:50 확정 · 거래대금200억↑ + 등락률&lt;8% + RSI40~68 + MA정배열<br>
+  🔴 <b style='color:#888;'>단타</b> 9:10 · 9:20 · 9:30 총 3회 · 갭1%↑ + 거래량3배↑ + RSI50~75 + RSI(2)보너스<br>
+  🌙 <b style='color:#888;'>종가배팅</b> 14:50 확정 · 거래대금200억↑ + 등락률&lt;8% + RSI40~68 + MA정배열 + 종가/고가≥95% + 거래량1.5배↑<br>
   <b style='color:#444;'>📋 조건 미충족 시 추천 없음 (쉬는 날)</b>
 </div>""",
             unsafe_allow_html=True,
@@ -525,7 +536,7 @@ def main():
         """
 <div style='color:#ff6b6b;font-weight:700;font-size:1rem;margin-bottom:4px;'>🔴 단타 추천</div>
 <div style='color:#666;font-size:0.75rem;margin-bottom:8px;'>
-  갭1%↑ · 거래량3배↑ · RSI50~75 · MA정배열 · 각 시간 확정 후 고정 (새로고침해도 유지)
+  갭1%↑ · 거래량3배↑ · RSI50~75 · RSI(2)눌림목 · 각 시간 확정 후 고정
 </div>""",
         unsafe_allow_html=True,
     )
@@ -567,7 +578,7 @@ def main():
      padding:16px 20px;display:flex;justify-content:space-between;align-items:center;'>
   <div>
     <div style='color:#4488ff;font-weight:700;'>🌙 종가배팅 대기 중</div>
-    <div style='color:#334466;font-size:0.75rem;margin-top:3px;'>거래대금200억↑ · 등락률&lt;8% · RSI40~68 · MA정배열</div>
+    <div style='color:#334466;font-size:0.75rem;margin-top:3px;'>거래대금200억↑ · 등락률&lt;8% · RSI40~68 · MA정배열 · 종가/고가≥95% · 거래량1.5배↑</div>
   </div>
   <div style='text-align:right;'>
     <div style='color:#4488ff;font-size:1.7rem;font-weight:900;'>{h2:02d}:{m3:02d}:{s3:02d}</div>
@@ -581,7 +592,7 @@ def main():
             """
 <div style='color:#4488ff;font-weight:700;font-size:1rem;margin-bottom:4px;'>🌙 종가배팅 추천 · 14:50 확정</div>
 <div style='color:#666;font-size:0.75rem;margin-bottom:12px;'>
-  거래대금200억↑ · 등락률&lt;8% · RSI40~68 · MA정배열 필수 · 다음날 9시 매도
+  거래대금200억↑ · 등락률&lt;8% · RSI40~68 · MA정배열 · 종가/고가≥95% · 거래량1.5배↑ · 다음날 9시 매도
 </div>""",
             unsafe_allow_html=True,
         )
@@ -600,7 +611,6 @@ def main():
 
     if st.button("🔄 새로고침"):
         st.cache_data.clear()
-        # session_state 초기화해도 파일 캐시에서 과거 슬롯 복원됨
         for k in ["danta_910", "danta_920", "danta_930", "jongga_1450"]:
             st.session_state.pop(k, None)
         st.rerun()
